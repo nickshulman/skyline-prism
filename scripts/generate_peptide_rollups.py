@@ -5,19 +5,27 @@ Given a folder containing ``PRISM.parquet`` (a Skyline "PRISM" report exported
 as parquet at transition level), this runs the skyline-prism transition ->
 peptide rollup and peptide-level normalization, writing:
 
-    unnormalized_polished_peptides.parquet   (rollup: median_polish)
-    unnormalized_summed_peptides.parquet     (rollup: sum)
-    median_normalized_peptides.parquet       (median_polish + median normalization)
-    rtloess_normalized_peptides.parquet      (median_polish + RT-lowess normalization)
+    unnormalized_polished_peptides.parquet      (rollup: median_polish)
+    unnormalized_summed_peptides.parquet        (rollup: sum)
+    median_normalized_peptides.parquet          (median_polish + median normalization)
+    rtloess_normalized_peptides.parquet         (median_polish + RT-lowess normalization)
+    protein_medianpolish_median_normalized.parquet  (median_normalized peptides -> protein median polish)
+    protein_medianpolish_rtloess_normalized.parquet (rtloess_normalized peptides -> protein median polish)
 
 The first two are the *un-normalized* peptide quantities (the pipeline's
 ``peptides_rollup.parquet``), isolating the transition -> peptide aggregation.
-The last two apply the pipeline's Stage 2b peptide normalization to the
+The next two apply the pipeline's Stage 2b peptide normalization to the
 median-polish rollup, isolating each normalization method (no batch correction).
+The last two roll those normalized peptide matrices up to proteins with the
+pipeline's Stage 4 peptide -> protein median polish, isolating the protein
+rollup. Peptides are grouped into proteins using the ``Protein`` column from the
+Skyline export (skyline-prism's "Skyline CSV-based parsimony"), so the grouping
+matches the Skyline document exactly.
 
-All files are in LOG2 scale, matching the pipeline's intermediate peptide
-matrices. They are used by Skyline's ``MedianPolishScenariosTest`` to verify
-that Skyline computes the same peptide quantities as skyline-prism.
+All files are in LOG2 scale, matching the pipeline's intermediate peptide and
+protein matrices. They are used by Skyline's ``MedianPolishScenariosTest`` to
+verify that Skyline computes the same peptide and protein quantities as
+skyline-prism.
 
 The merge, column auto-detection, rollup, and normalization reuse the same
 skyline-prism functions that ``prism run`` uses, so the output matches what the
@@ -46,8 +54,20 @@ from skyline_prism.chunked_processing import ChunkedRollupConfig, rollup_transit
 from skyline_prism.cli import find_column
 from skyline_prism.data_io import merge_and_sort_streaming
 from skyline_prism.normalization import apply_rt_lowess_normalization
+from skyline_prism.rollup import rollup_protein_matrix
 
 INPUT_FILENAME = "PRISM.parquet"
+
+# Column in the Skyline export that names the protein each peptide belongs to.
+PROTEIN_COL = "Protein"
+PEPTIDE_KEY_COL = "PeptideModifiedSequenceUnimodIds"
+
+# Minimum peptides for a protein to use median polish instead of the simpler
+# fallbacks (1 peptide -> use directly; below the threshold -> linear sum).
+# Matches the skyline-prism config templates (protein_rollup.min_peptides: 2) and
+# Skyline's ProteinQuantifier, where MedianPolisher already uses a lone peptide
+# directly and median-polishes any protein with two or more peptides.
+PROTEIN_MIN_PEPTIDES = 2
 
 # Rollup method -> un-normalized output filename.
 ROLLUP_OUTPUTS = {
@@ -60,8 +80,16 @@ ROLLUP_OUTPUTS = {
 MEDIAN_NORMALIZED_OUTPUT = "median_normalized_peptides.parquet"
 RTLOESS_NORMALIZED_OUTPUT = "rtloess_normalized_peptides.parquet"
 
-# Metadata (non-sample) columns in a rollup parquet.
-META_COLS = ("PeptideModifiedSequenceUnimodIds", "n_transitions", "mean_rt")
+# Output filenames for the peptide -> protein median-polish rollup of each
+# normalized peptide matrix.
+PROTEIN_MEDIAN_NORMALIZED_OUTPUT = "protein_medianpolish_median_normalized.parquet"
+PROTEIN_RTLOESS_NORMALIZED_OUTPUT = "protein_medianpolish_rtloess_normalized.parquet"
+
+# Metadata (non-sample) columns in a peptide rollup parquet.
+META_COLS = (PEPTIDE_KEY_COL, "n_transitions", "mean_rt")
+
+# Metadata (non-sample) columns in a protein rollup parquet.
+PROTEIN_META_COLS = (PROTEIN_COL, "n_peptides")
 
 
 def _merge(prism_path: Path, work_dir: Path) -> tuple[Path, dict[str, str]]:
@@ -171,6 +199,54 @@ def _write(df: pd.DataFrame, out_path: Path, label: str) -> None:
     print(f"  {label:>13} -> {out_path.name}  ({len(df)} peptides)")
 
 
+def _build_protein_peptide_map(prism_path: Path) -> dict[str, list[str]]:
+    """Map each protein to its peptides using the Skyline export's protein column.
+
+    Reads the ``Protein`` and ``PeptideModifiedSequenceUnimodIds`` columns of the
+    PRISM export and groups peptides by protein. A peptide shared across several
+    proteins (same modified sequence under more than one Skyline protein) is
+    listed under each of its proteins, mirroring the Skyline document where the
+    peptide appears as a separate node under every protein it maps to.
+    """
+    df = pq.read_table(prism_path, columns=[PROTEIN_COL, PEPTIDE_KEY_COL]).to_pandas()
+    df = df.dropna(subset=[PROTEIN_COL, PEPTIDE_KEY_COL]).drop_duplicates()
+    protein_to_peptides: dict[str, list[str]] = {}
+    for protein, peptide in zip(df[PROTEIN_COL], df[PEPTIDE_KEY_COL]):
+        protein_to_peptides.setdefault(protein, []).append(peptide)
+    return protein_to_peptides
+
+
+def _rollup_proteins(peptide_df: pd.DataFrame, protein_to_peptides: dict[str, list[str]]) -> pd.DataFrame:
+    """Roll a normalized peptide matrix up to proteins via median polish.
+
+    For each protein, the rows of ``peptide_df`` for that protein's peptides are
+    median-polished (``rollup_protein_matrix``), reproducing Skyline's Stage 4
+    peptide -> protein rollup. ``PROTEIN_MIN_PEPTIDES`` controls the small-protein
+    fallbacks. Input and output are LOG2 scale. Proteins with no measured peptides
+    are skipped.
+    """
+    sample_cols = _sample_columns(peptide_df)
+    peptide_index = peptide_df.set_index(PEPTIDE_KEY_COL)
+    rows = []
+    for protein, peptides in protein_to_peptides.items():
+        present = [p for p in peptides if p in peptide_index.index]
+        if not present:
+            continue
+        matrix = peptide_index.loc[present, sample_cols]
+        result = rollup_protein_matrix(matrix, method="median_polish", min_peptides=PROTEIN_MIN_PEPTIDES)
+        abundances = result.abundances
+        row = {PROTEIN_COL: protein, "n_peptides": len(present)}
+        for col in sample_cols:
+            row[col] = abundances.get(col)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=list(PROTEIN_META_COLS) + sample_cols)
+
+
+def _write_proteins(df: pd.DataFrame, out_path: Path, label: str) -> None:
+    df.to_parquet(out_path, index=False)
+    print(f"  {label:>13} -> {out_path.name}  ({len(df)} proteins)")
+
+
 def generate(folder: Path) -> None:
     prism_path = folder / INPUT_FILENAME
     if not prism_path.exists():
@@ -187,8 +263,17 @@ def generate(folder: Path) -> None:
         _rollup(merged_path, cols, "sum", folder / ROLLUP_OUTPUTS["sum"])
 
         # Peptide-level normalizations applied to the median-polish rollup.
-        _write(_median_normalize(polished_df), folder / MEDIAN_NORMALIZED_OUTPUT, "median")
-        _write(_rt_lowess_normalize(polished_df), folder / RTLOESS_NORMALIZED_OUTPUT, "rt_lowess")
+        median_normalized_df = _median_normalize(polished_df)
+        _write(median_normalized_df, folder / MEDIAN_NORMALIZED_OUTPUT, "median")
+        rtloess_normalized_df = _rt_lowess_normalize(polished_df)
+        _write(rtloess_normalized_df, folder / RTLOESS_NORMALIZED_OUTPUT, "rt_lowess")
+
+        # Peptide -> protein median-polish rollup of each normalized peptide matrix.
+        protein_to_peptides = _build_protein_peptide_map(prism_path)
+        _write_proteins(_rollup_proteins(median_normalized_df, protein_to_peptides),
+                        folder / PROTEIN_MEDIAN_NORMALIZED_OUTPUT, "prot median")
+        _write_proteins(_rollup_proteins(rtloess_normalized_df, protein_to_peptides),
+                        folder / PROTEIN_RTLOESS_NORMALIZED_OUTPUT, "prot rt_lowess")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
